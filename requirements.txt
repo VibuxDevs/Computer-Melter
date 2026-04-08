@@ -1,4 +1,6 @@
 pygame>=2.5.0
 mss>=9.0.0
 numpy>=1.24.0
+SpeechRecognition>=3.10.0
+# pyaudio: mic access for voice quit (OS package often named python-pyaudio / portaudio)
 # Overlay default: PySide6>=6.5.0  and  pynput (global ESC to quit)

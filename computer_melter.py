@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+import threading
 import time
 
 import mss
@@ -108,6 +110,7 @@ def run_pygame(
     *,
     fullscreen: bool,
     window_fraction: float,
+    voice_quit: bool = True,
 ) -> None:
     os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
     pygame.init()
@@ -143,7 +146,14 @@ def run_pygame(
     running = True
     rgb = rgb0
 
+    voice_stop = threading.Event()
+    voice_stop_fn = None
+    if voice_quit:
+        voice_stop_fn = _start_voice_stop_listener(voice_stop.set, pygame_mode=True)
+
     while running:
+        if voice_stop.is_set():
+            running = False
         dt = clock.tick(60) / 1000.0
         now = time.perf_counter() - start
         intensity = float(np.clip(now / 45.0, 0.0, 1.0))
@@ -172,7 +182,12 @@ def run_pygame(
 
         screen.blit(surf, (0, 0))
 
-        hint = font.render("COMPUTER MELTER — ESC to exit", True, (255, 80, 80))
+        hint_txt = (
+            'COMPUTER MELTER — ESC or say "computer stop melting"'
+            if voice_stop_fn is not None
+            else "COMPUTER MELTER — ESC to exit"
+        )
+        hint = font.render(hint_txt, True, (255, 80, 80))
         bg = pygame.Surface((hint.get_width() + 12, hint.get_height() + 8), pygame.SRCALPHA)
         bg.fill((0, 0, 0, 160))
         screen.blit(bg, (6, 6))
@@ -183,7 +198,84 @@ def run_pygame(
 
         pygame.display.flip()
 
+    if voice_stop_fn is not None:
+        voice_stop_fn(wait_for_stop=False)
     pygame.quit()
+
+
+# Spoken exit phrase (Google Speech API et al. may drop small words — keep matching loose).
+_VOICE_STOP_PHRASE = "computer stop melting"
+
+
+def _text_requests_voice_stop(text: str) -> bool:
+    s = " ".join(text.lower().split())
+    if _VOICE_STOP_PHRASE in s:
+        return True
+    if "computer" in s and "stop" in s and "melt" in s:
+        return True
+    compact = re.sub(r"[^a-z0-9]+", "", s)
+    return "computerstopmelt" in compact
+
+
+def _start_voice_stop_listener(on_heard, *, pygame_mode: bool) -> object | None:
+    """
+    Background mic listening; calls on_heard() when the stop phrase is recognized.
+    Returns a stop function from speech_recognition.listen_in_background, or None.
+    on_heard may be called from a worker thread (Qt: use Signals).
+    """
+    try:
+        import speech_recognition as sr
+    except ImportError:
+        print(
+            "Voice quit: install SpeechRecognition and PyAudio "
+            "(e.g. pip install SpeechRecognition pyaudio)",
+            file=sys.stderr,
+        )
+        return None
+
+    r = sr.Recognizer()
+    try:
+        mic = sr.Microphone()
+    except Exception as e:
+        print(f"Voice quit: microphone not available ({e})", file=sys.stderr)
+        return None
+
+    heard_lock = threading.Lock()
+    last_fire = 0.0
+    request_error_logged = False
+
+    def _callback(recognizer: object, audio: object) -> None:
+        nonlocal last_fire, request_error_logged
+        try:
+            text = recognizer.recognize_google(audio)  # type: ignore[attr-defined]
+        except sr.UnknownValueError:
+            return
+        except sr.RequestError:
+            if pygame_mode and not request_error_logged:
+                request_error_logged = True
+                print("Voice quit: speech service unavailable (network?)", file=sys.stderr)
+            return
+        if not _text_requests_voice_stop(text):
+            return
+        with heard_lock:
+            now = time.perf_counter()
+            if now - last_fire < 2.0:
+                return
+            last_fire = now
+        on_heard()
+
+    try:
+        with mic as source:
+            r.adjust_for_ambient_noise(source, duration=0.5)
+    except Exception as e:
+        print(f"Voice quit: could not calibrate microphone ({e})", file=sys.stderr)
+        return None
+
+    try:
+        return r.listen_in_background(mic, _callback, phrase_time_limit=8)
+    except Exception as e:
+        print(f"Voice quit: could not start background listen ({e})", file=sys.stderr)
+        return None
 
 
 def numpy_rgb_to_qimage(rgb: np.ndarray):
@@ -198,11 +290,21 @@ def numpy_rgb_to_qimage(rgb: np.ndarray):
     return QImage(buf.data, ww, hh, bpl, QImage.Format.Format_RGB888).copy()
 
 
-def _start_global_esc_quit(app) -> object | None:
+def _make_qt_quit_bridge(app) -> object:
+    from PySide6.QtCore import QObject, Signal
+
+    class _QuitBridge(QObject):
+        quit_requested = Signal()
+
+    bridge = _QuitBridge()
+    bridge.quit_requested.connect(app.quit)
+    return bridge
+
+
+def _start_global_esc_quit(bridge: object) -> object | None:
     """Register ESC anywhere to quit (overlay ignores focus / input). Returns listener or None."""
     try:
         from pynput import keyboard
-        from PySide6.QtCore import QObject, Signal
     except ImportError:
         print(
             "Install pynput for ESC to quit the overlay: pip install pynput",
@@ -210,22 +312,21 @@ def _start_global_esc_quit(app) -> object | None:
         )
         return None
 
-    class _EscBridge(QObject):
-        quit_requested = Signal()
-
-    bridge = _EscBridge()
-    bridge.quit_requested.connect(app.quit)
-
     def on_press(key: object) -> None:
         if key == keyboard.Key.esc:
-            bridge.quit_requested.emit()
+            bridge.quit_requested.emit()  # type: ignore[attr-defined]
 
     listener = keyboard.Listener(on_press=on_press, suppress=False)
     listener.start()
     return listener
 
 
-def run_qt_overlay(*, max_w: int = 1280, live_refresh_ms: int = 0) -> None:
+def run_qt_overlay(
+    *,
+    max_w: int = 1280,
+    live_refresh_ms: int = 0,
+    voice_quit: bool = True,
+) -> None:
     try:
         from PySide6.QtCore import Qt, QTimer
         from PySide6.QtGui import QPixmap
@@ -312,7 +413,18 @@ def run_qt_overlay(*, max_w: int = 1280, live_refresh_ms: int = 0) -> None:
             file=sys.stderr,
         )
 
-    esc_listener = _start_global_esc_quit(app)
+    bridge = _make_qt_quit_bridge(app)
+    esc_listener = _start_global_esc_quit(bridge)
+    voice_stop_fn = None
+    if voice_quit:
+        voice_stop_fn = _start_voice_stop_listener(
+            lambda: bridge.quit_requested.emit(),  # type: ignore[attr-defined]
+            pygame_mode=False,
+        )
+    if voice_stop_fn is not None:
+        win._hint.setText(win._hint.text() + " · Say: computer stop melting")
+        win._hint.adjustSize()
+        win._hint.move(8, win.height() - win._hint.height() - 10)
 
     rng = np.random.default_rng()
     start = time.perf_counter()
@@ -375,6 +487,8 @@ def run_qt_overlay(*, max_w: int = 1280, live_refresh_ms: int = 0) -> None:
     try:
         exit_code = app.exec()
     finally:
+        if voice_stop_fn is not None:
+            voice_stop_fn(wait_for_stop=False)
         if esc_listener is not None:
             esc_listener.stop()
     raise SystemExit(exit_code)
@@ -406,14 +520,23 @@ def main() -> None:
         metavar="F",
         help="With --window: size as fraction of screen (default 0.68)",
     )
+    p.add_argument(
+        "--no-voice",
+        action="store_true",
+        help="Disable spoken 'computer stop melting' exit (no mic / SpeechRecognition).",
+    )
     args = p.parse_args()
 
     if args.window:
         frac = float(np.clip(args.size, 0.25, 0.95))
-        run_pygame(fullscreen=args.fullscreen, window_fraction=frac)
+        run_pygame(
+            fullscreen=args.fullscreen,
+            window_fraction=frac,
+            voice_quit=not args.no_voice,
+        )
     else:
         ms = max(0, int(args.refresh_ms))
-        run_qt_overlay(live_refresh_ms=ms)
+        run_qt_overlay(live_refresh_ms=ms, voice_quit=not args.no_voice)
 
 
 if __name__ == "__main__":
