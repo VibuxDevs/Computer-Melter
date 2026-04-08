@@ -66,4 +66,3 @@ Then run:
 - `computer_melter.py` — entrypoint and effect implementation.
 - `run.sh` — launcher that uses `.venv`.
 - `requirements.txt` — pygame, mss, numpy; overlay also needs **PySide6** and **pynput** (install as in Setup).
-# Computer-Melter
