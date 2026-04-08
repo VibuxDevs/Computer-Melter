@@ -1,0 +1,4 @@
+pygame>=2.5.0
+mss>=9.0.0
+numpy>=1.24.0
+# Overlay default: PySide6>=6.5.0  and  pynput (global ESC to quit)
